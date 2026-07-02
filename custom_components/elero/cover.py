@@ -64,6 +64,7 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 ATTR_ELERO_STATE = "elero_state"
+CONF_POLLING = "polling"
 
 SUPPORTED_FEATURES = {
     "close_tilt": CoverEntityFeature.CLOSE_TILT,
@@ -96,6 +97,7 @@ COVER_SCHEMA = vol.Schema(
         vol.Optional(
             CONF_TILT_TRAVEL_TIME, default=DEFAULT_TILT_TRAVEL_TIME
         ): vol.Coerce(float),
+        vol.Optional(CONF_POLLING, default=True): cv.boolean,
     }
 )
 
@@ -149,6 +151,7 @@ def setup_platform(hass, config, add_devices, discovery_info=None):
                     CONF_TILT_TRAVEL_TIME, DEFAULT_TILT_TRAVEL_TIME
                 ),
                 unique_suffix=str(channel),
+                polling=bool(cover_conf.get(CONF_POLLING, True)),
             )
         )
     add_devices(covers, True)
@@ -205,6 +208,7 @@ async def async_setup_entry(
             ),
             unique_suffix=str(int(subentry.data[CONF_CHANNEL])),
             hub_serial=serial,
+            polling=bool(subentry.data.get(CONF_POLLING, True)),
         )
         by_subentry.setdefault(subentry_id, []).append(cover)
 
@@ -225,8 +229,6 @@ class EleroCover(CoverEntity, RestoreEntity):
     position.
     """
 
-    _attr_should_poll = True
-
     async def async_added_to_hass(self):
         """Restore state on HA startup."""
         await super().async_added_to_hass()
@@ -242,6 +244,10 @@ class EleroCover(CoverEntity, RestoreEntity):
             "Restored state for %s: position=%s", self._attr_name, self._position
         )
 
+    async def async_will_remove_from_hass(self) -> None:
+        """Cancel any pending timed stop when entity is removed or reloaded."""
+        self._cancel_scheduled_stop()
+
     def __init__(
         self,
         *,
@@ -256,12 +262,14 @@ class EleroCover(CoverEntity, RestoreEntity):
         tilt_travel_time: float = DEFAULT_TILT_TRAVEL_TIME,
         unique_suffix: str | None = None,
         hub_serial: str | None = None,
+        polling: bool = True,
     ):
         self.hass = hass
         self._transmitter = transmitter
         self._channel = channel
         self._tilt_step = tilt_step
         self._tilt_travel_time = tilt_travel_time
+        self._attr_should_poll = polling
 
         serial = hub_serial or transmitter.get_serial_number()
         suffix = unique_suffix or str(channel)
@@ -318,6 +326,17 @@ class EleroCover(CoverEntity, RestoreEntity):
     # ── HA entity properties ────────────────────────────────────────────
 
     @property
+    def travel_time(self) -> float:
+        """Return travel time, preferring input_number.elero_travel_time if set."""
+        state = self.hass.states.get("input_number.elero_travel_time")
+        if state is not None:
+            try:
+                return float(state.state)
+            except (ValueError, TypeError):
+                pass
+        return self._travel_time
+
+    @property
     def available(self):
         return self._available
 
@@ -329,7 +348,7 @@ class EleroCover(CoverEntity, RestoreEntity):
             and self._move_start_position is not None
         ):
             elapsed = time.time() - self._move_start_time
-            delta = (elapsed / self._travel_time) * 100.0 * self._move_direction
+            delta = (elapsed / self.travel_time) * 100.0 * self._move_direction
             return max(0, min(100, round(self._move_start_position + delta)))
         return self._position
 
@@ -355,7 +374,7 @@ class EleroCover(CoverEntity, RestoreEntity):
         if self._elero_state is not None:
             data[ATTR_ELERO_STATE] = self._elero_state
         data["channel"] = self._channel
-        data["travel_time"] = self._travel_time
+        data["travel_time"] = self.travel_time
         data["tilt_step"] = self._tilt_step
         data["tilt_travel_time"] = self._tilt_travel_time
         data["move_start_position"] = self._move_start_position
@@ -434,16 +453,25 @@ class EleroCover(CoverEntity, RestoreEntity):
     def open_cover(self, **kwargs):
         self._transmitter.up(self._channel)
         self._start_moving(+1)
-        self.hass.loop.call_later(self._travel_time + 1, self.update)
+        self.schedule_update_ha_state()
+        self.hass.loop.call_later(
+            self.travel_time + 1,
+            lambda: self.hass.async_add_executor_job(self.update),
+        )
 
     def close_cover(self, **kwargs):
         self._transmitter.down(self._channel)
         self._start_moving(-1)
-        self.hass.loop.call_later(self._travel_time + 1, self.update)
+        self.schedule_update_ha_state()
+        self.hass.loop.call_later(
+            self.travel_time + 1,
+            lambda: self.hass.async_add_executor_job(self.update),
+        )
 
     def stop_cover(self, **kwargs):
         self._transmitter.stop(self._channel)
         self._stop_moving()
+        self.schedule_update_ha_state()
 
     def set_cover_position(self, **kwargs):
         """Move to a specific position (time-based approximation)."""
@@ -459,7 +487,7 @@ class EleroCover(CoverEntity, RestoreEntity):
             )
             self.open_cover()
             self._scheduled_stop = self.hass.loop.call_later(
-                self._travel_time + 2,
+                self.travel_time + 2,
                 lambda: self.set_cover_position(position=target),
             )
             return
@@ -468,7 +496,7 @@ class EleroCover(CoverEntity, RestoreEntity):
         if abs(diff) < 2:
             return
 
-        move_time = abs(diff) / 100.0 * self._travel_time
+        move_time = abs(diff) / 100.0 * self.travel_time
 
         if diff > 0:
             self._transmitter.up(self._channel)
@@ -601,9 +629,18 @@ class EleroCover(CoverEntity, RestoreEntity):
     # ── response handling ───────────────────────────────────────────────
 
     def response_handler(self, response):
-        """Callback invoked by the transmitter with a device response."""
+        """Callback invoked by the transmitter from an executor thread.
+
+        Schedules the actual state update on the event loop to avoid
+        concurrent attribute mutations between the executor and the loop.
+        """
         self._response = response
+        self.hass.loop.call_soon_threadsafe(self._apply_response)
+
+    def _apply_response(self):
+        """Apply the last response and push state to HA (runs on event loop)."""
         self._set_states()
+        self.async_write_ha_state()
 
     def _set_states(self):
         """Update cover state from the last device response."""
@@ -634,7 +671,12 @@ class EleroCover(CoverEntity, RestoreEntity):
             self._closed = False
 
         elif status == INFO_TILT_VENTILATION_POS_STOP:
-            if time.time() < self._tilt_step_lock_until:
+            if self._tilt_step == 0:
+                # No tilt configured (plain roller shutter) — ventilation stop is a partial stop
+                self._stop_moving(final_position=POSITION_TILT_VENTILATION)
+                self._tilt_position = None
+                self._closed = False
+            elif time.time() < self._tilt_step_lock_until:
                 _LOGGER.debug(
                     "%s: ignoring TILT_VENTILATION_POS_STOP — tilt_step lock active",
                     self._attr_name,
@@ -645,7 +687,13 @@ class EleroCover(CoverEntity, RestoreEntity):
                 self._closed = False
 
         elif status == INFO_TOP_POS_STOP_WICH_TILT_POS:
-            if time.time() < self._tilt_step_lock_until:
+            if self._tilt_step == 0:
+                # No tilt configured (plain roller shutter) — treat as plain top stop
+                self._stop_moving(final_position=POSITION_OPEN)
+                self._tilt_position = None
+                self._timed_tilt_lock_until = 0.0
+                self._closed = False
+            elif time.time() < self._tilt_step_lock_until:
                 _LOGGER.debug(
                     "%s: ignoring TOP_POS_STOP_WICH_TILT_POS — tilt_step lock active",
                     self._attr_name,

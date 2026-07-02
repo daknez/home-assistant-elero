@@ -19,7 +19,7 @@ from homeassistant.const import (
     CONF_NAME,
     EVENT_HOMEASSISTANT_STOP,
 )
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.event import async_track_time_interval
@@ -298,8 +298,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         ELERO_TRANSMITTERS = EleroTransmitters(None)
     ELERO_TRANSMITTERS.transmitters[transmitter.get_serial_number()] = transmitter
 
-    @callback
-    def _watchdog(_now):
+    async def _watchdog(_now):
         if transmitter.last_response_ts is None:
             return
         idle = time.time() - transmitter.last_response_ts
@@ -309,7 +308,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 transmitter.get_serial_number(),
                 idle,
             )
-            hass.async_add_executor_job(transmitter.check)
+            try:
+                await hass.async_add_executor_job(transmitter.check)
+            except Exception:
+                _LOGGER.warning(
+                    "Watchdog check failed for '%s'",
+                    transmitter.get_serial_number(),
+                    exc_info=True,
+                )
 
     entry.async_on_unload(
         async_track_time_interval(hass, _watchdog, timedelta(minutes=2))
@@ -371,6 +377,7 @@ def _auto_import_yaml_covers(
                 CONF_TILT_TRAVEL_TIME: float(
                     cov.get(CONF_TILT_TRAVEL_TIME, DEFAULT_TILT_TRAVEL_TIME)
                 ),
+                "polling": bool(cov.get("polling", True)),
             }
         except KeyError as exc:
             _LOGGER.warning(
@@ -496,7 +503,7 @@ class EleroTransmitter:
                 self._bytesize,
                 self._parity,
                 self._stopbits,
-                timeout=2,
+                timeout=4,        # matches Elero protocol spec ("within 4 seconds")
                 write_timeout=2,
             )
         except serial.serialutil.SerialException as exc:
@@ -665,13 +672,14 @@ class EleroTransmitter:
                                 "Serial port not initialised"
                             )
                     try:
-                        self._serial.timeout = 2
+                        self._serial.timeout = 4        # matches Elero protocol spec
                         self._serial.write_timeout = 2
                     except Exception:
                         pass
 
+                    self._serial.reset_input_buffer()   # flush stale bytes from partial reads
                     self._serial.write(bytes_data)
-                    ser_resp = self._read_exact(resp_length, overall_timeout=2.5)
+                    ser_resp = self._read_exact(resp_length, overall_timeout=4.0)
                 finally:
                     self._threading_lock.release()
 
@@ -679,6 +687,18 @@ class EleroTransmitter:
                     _LOGGER.warning(
                         "Empty/timeout response for '%s' (attempt %d)",
                         command_text,
+                        attempt,
+                    )
+                    self._recover_serial()
+                    continue
+
+                if ser_resp[0] != BYTE_HEADER:
+                    _LOGGER.debug(
+                        "Misaligned response from '%s' ch '%s' cmd '%s' resp: %s attempt %d. Retrying.",
+                        self._serial_number,
+                        channel,
+                        command_text,
+                        ser_resp,
                         attempt,
                     )
                     self._recover_serial()
@@ -762,9 +782,9 @@ class EleroTransmitter:
                 self._learned_channels[ch](resp)
             else:
                 _LOGGER.error(
-                    "The channel is not learned '%s' on the transmitter: '%s'.",
-                    self._serial_number,
+                    "The channel '%s' is not learned on the transmitter: '%s'.",
                     ch,
+                    self._serial_number,
                 )
 
     def __parse_response(self, ser_resp, channel):
